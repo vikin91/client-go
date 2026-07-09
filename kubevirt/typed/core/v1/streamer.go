@@ -21,18 +21,27 @@ package v1
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 type wsStreamer struct {
-	conn *websocket.Conn
-	done chan struct{}
+	conn      *websocket.Conn
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
+// streamDone signals AsyncSubresourceHelper's round-tripper goroutine that
+// this stream is finished, so it can let its deferred conn.Close() run. It
+// is called both when Stream() returns and when the net.Conn returned by
+// AsConn() is closed, so it must be safe to call more than once (e.g. if a
+// caller closes the AsConn() connection *and* the wsStreamer was also
+// obtained through NewWebsocketStreamer with an externally managed done
+// channel).
 func (ws *wsStreamer) streamDone() {
-	close(ws.done)
+	ws.closeOnce.Do(func() { close(ws.done) })
 }
 
 func (ws *wsStreamer) Stream(options StreamOptions) error {
@@ -57,6 +66,7 @@ func (ws *wsStreamer) AsConn() net.Conn {
 		Conn:         ws.conn,
 		binaryReader: &binaryReader{conn: ws.conn},
 		binaryWriter: &binaryWriter{conn: ws.conn},
+		streamDone:   ws.streamDone,
 	}
 }
 
@@ -64,6 +74,23 @@ type wsConn struct {
 	*websocket.Conn
 	*binaryReader
 	*binaryWriter
+	// streamDone is wsStreamer.streamDone, carried over so that closing the
+	// net.Conn returned by AsConn() also unblocks AsyncWSRoundTripper's
+	// round-trip goroutine. Without this, that goroutine (and everything it
+	// holds onto) leaks for the life of the process, because it otherwise
+	// only unblocks when Stream() returns - which AsConn() callers never
+	// call.
+	streamDone func()
+}
+
+// Close closes the underlying websocket connection and releases the
+// AsyncSubresourceHelper goroutine that dialed it. The round-tripper this
+// connection came from also has its own deferred close of the same
+// websocket.Conn once that goroutine unblocks; closing it here first is
+// intentional and the resulting second Close() call is a harmless no-op.
+func (c *wsConn) Close() error {
+	defer c.streamDone()
+	return c.Conn.Close()
 }
 
 func (c *wsConn) SetDeadline(t time.Time) error {
